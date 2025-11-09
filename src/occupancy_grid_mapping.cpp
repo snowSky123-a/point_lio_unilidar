@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <vector>
 
@@ -49,26 +51,13 @@ private:
         pnh_.param<double>("max_height", max_height_, 2.0);
         pnh_.param<double>("max_range", max_range_, 80.0);
 
-        double hit_probability;
-        double miss_probability;
-        pnh_.param<double>("hit_probability", hit_probability, 0.7);
-        pnh_.param<double>("miss_probability", miss_probability, 0.4);
+        pnh_.param<double>("hit_probability", hit_probability_, 0.7);
+        pnh_.param<double>("miss_probability", miss_probability_, 0.4);
         pnh_.param<double>("occupied_threshold", occupied_threshold_, 0.65);
         pnh_.param<double>("free_threshold", free_threshold_, 0.35);
 
-        hit_probability = std::min(std::max(hit_probability, 0.51), 0.99);
-        miss_probability = std::min(std::max(miss_probability, 0.01), 0.49);
-
-        log_odds_hit_ = probabilityToLogOdds(hit_probability);
-        log_odds_miss_ = probabilityToLogOdds(miss_probability);
-
-        double min_probability;
-        double max_probability;
-        pnh_.param<double>("min_probability", min_probability, 0.12);
-        pnh_.param<double>("max_probability", max_probability, 0.97);
-
-        log_odds_min_ = probabilityToLogOdds(min_probability);
-        log_odds_max_ = probabilityToLogOdds(max_probability);
+        hit_probability_ = std::min(std::max(hit_probability_, 0.51), 0.99);
+        miss_probability_ = std::min(std::max(miss_probability_, 0.01), 0.49);
 
         pnh_.param<double>("publish_frequency", publish_frequency_, 5.0);
 
@@ -89,7 +78,7 @@ private:
     void initialiseMap()
     {
         const std::size_t cell_count = static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_);
-        log_odds_.assign(cell_count, 0.0);
+        cells_.assign(cell_count, kUnknownProbabilityValue);
         map_.info.resolution = resolution_;
         map_.info.width = width_;
         map_.info.height = height_;
@@ -102,6 +91,9 @@ private:
         map_.info.origin.orientation.z = 0.0;
         map_.header.frame_id = map_frame_;
         map_.data.assign(cell_count, -1);
+
+        hit_lookup_table_ = createLookupTableToApplyOdds(probabilityToOdds(static_cast<float>(hit_probability_)));
+        miss_lookup_table_ = createLookupTableToApplyOdds(probabilityToOdds(static_cast<float>(miss_probability_)));
     }
 
     void odomCallback(const nav_msgs::OdometryConstPtr &msg)
@@ -230,7 +222,7 @@ private:
 
     void publishMap(const ros::Time &stamp)
     {
-        if (log_odds_.empty())
+        if (cells_.empty())
         {
             return;
         }
@@ -238,17 +230,17 @@ private:
         map_.header.stamp = stamp;
         map_.info.map_load_time = stamp;
 
-        map_.data.resize(log_odds_.size());
-        for (std::size_t idx = 0; idx < log_odds_.size(); ++idx)
+        map_.data.resize(cells_.size());
+        for (std::size_t idx = 0; idx < cells_.size(); ++idx)
         {
-            const double log_odds = log_odds_[idx];
-            if (std::fabs(log_odds) < 1e-6)
+            const std::uint16_t value = cells_[idx];
+            if (value == kUnknownProbabilityValue)
             {
                 map_.data[idx] = -1;
                 continue;
             }
 
-            const double probability = logOddsToProbability(log_odds);
+            const double probability = static_cast<double>(valueToProbability(value));
             if (probability >= occupied_threshold_)
             {
                 map_.data[idx] = 100;
@@ -265,18 +257,6 @@ private:
 
         map_pub_.publish(map_);
         map_updated_ = false;
-    }
-
-    static double probabilityToLogOdds(double probability)
-    {
-        const double clamped = std::min(std::max(probability, 1e-6), 1.0 - 1e-6);
-        return std::log(clamped / (1.0 - clamped));
-    }
-
-    static double logOddsToProbability(double log_odds)
-    {
-        const double odds = std::exp(log_odds);
-        return odds / (1.0 + odds);
     }
 
     bool worldToMap(double wx, double wy, int &mx, int &my) const
@@ -326,16 +306,16 @@ private:
                 break;
             }
 
-            updateCell(x, y, -log_odds_miss_);
+            applyLookupTable(x, y, miss_lookup_table_);
         }
     }
 
     void updateOccupiedCell(int x, int y)
     {
-        updateCell(x, y, log_odds_hit_);
+        applyLookupTable(x, y, hit_lookup_table_);
     }
 
-    void updateCell(int x, int y, double update)
+    void applyLookupTable(int x, int y, const std::array<std::uint16_t, kValueCount> &table)
     {
         if (x < 0 || y < 0 || x >= width_ || y >= height_)
         {
@@ -343,7 +323,65 @@ private:
         }
 
         const std::size_t index = static_cast<std::size_t>(y) * width_ + static_cast<std::size_t>(x);
-        log_odds_[index] = std::min(std::max(log_odds_[index] + update, log_odds_min_), log_odds_max_);
+        cells_[index] = table[cells_[index]];
+    }
+
+    static float clampProbability(float probability)
+    {
+        return std::min(std::max(probability, kMinProbability), kMaxProbability);
+    }
+
+    static float probabilityToOdds(float probability)
+    {
+        const float clamped = clampProbability(probability);
+        return clamped / (1.f - clamped);
+    }
+
+    static float oddsToProbability(float odds)
+    {
+        const float positive_odds = std::max(odds, 1e-6f);
+        return positive_odds / (1.f + positive_odds);
+    }
+
+    static std::uint16_t probabilityToValue(float probability)
+    {
+        const float clamped = clampProbability(probability);
+        const float scaled = (clamped - kMinProbability) * kValueScale;
+        const std::uint16_t value = static_cast<std::uint16_t>(std::lround(scaled)) + 1u;
+        return std::min<std::uint16_t>(value, kMaxKnownProbabilityValue);
+    }
+
+    static float valueToProbability(std::uint16_t value)
+    {
+        return valueToProbabilityTable()[value];
+    }
+
+    static const std::array<float, kValueCount> &valueToProbabilityTable()
+    {
+        static const std::array<float, kValueCount> table = []()
+        {
+            std::array<float, kValueCount> data{};
+            data[kUnknownProbabilityValue] = kUnknownProbability;
+            for (std::size_t i = 1; i < kValueCount; ++i)
+            {
+                data[i] = kMinProbability + static_cast<float>(i - 1) / kValueScale;
+            }
+            return data;
+        }();
+        return table;
+    }
+
+    std::array<std::uint16_t, kValueCount> createLookupTableToApplyOdds(float odds) const
+    {
+        std::array<std::uint16_t, kValueCount> table{};
+        table[kUnknownProbabilityValue] = probabilityToValue(oddsToProbability(odds));
+        for (std::size_t i = 1; i < kValueCount; ++i)
+        {
+            const float current_probability = valueToProbability(static_cast<std::uint16_t>(i));
+            const float updated_probability = oddsToProbability(probabilityToOdds(current_probability) * odds);
+            table[i] = probabilityToValue(updated_probability);
+        }
+        return table;
     }
 
     double yawFromQuaternion(const geometry_msgs::Quaternion &q) const
@@ -377,7 +415,9 @@ private:
     ros::Timer publish_timer_;
 
     nav_msgs::OccupancyGrid map_;
-    std::vector<double> log_odds_;
+    std::vector<std::uint16_t> cells_;
+    std::array<std::uint16_t, kValueCount> hit_lookup_table_{};
+    std::array<std::uint16_t, kValueCount> miss_lookup_table_{};
 
     std::string point_cloud_topic_;
     std::string odom_topic_;
@@ -391,10 +431,8 @@ private:
     double min_height_ = -1.0;
     double max_height_ = 2.0;
     double max_range_ = 80.0;
-    double log_odds_hit_ = 0.0;
-    double log_odds_miss_ = 0.0;
-    double log_odds_min_ = probabilityToLogOdds(0.12);
-    double log_odds_max_ = probabilityToLogOdds(0.97);
+    double hit_probability_ = 0.7;
+    double miss_probability_ = 0.4;
     double publish_frequency_ = 5.0;
     double occupied_threshold_ = 0.65;
     double free_threshold_ = 0.35;
@@ -405,6 +443,13 @@ private:
     bool continuous_publish_ = false;
 
     static constexpr double kPi = 3.14159265358979323846;
+    static constexpr std::uint16_t kUnknownProbabilityValue = 0u;
+    static constexpr std::uint16_t kValueCount = 32768u;
+    static constexpr std::uint16_t kMaxKnownProbabilityValue = kValueCount - 1u;
+    static constexpr float kMinProbability = 0.1f;
+    static constexpr float kMaxProbability = 0.9f;
+    static constexpr float kUnknownProbability = 0.5f;
+    static constexpr float kValueScale = (kValueCount - 2u) / (kMaxProbability - kMinProbability);
 
     std::mutex pose_mutex_;
     geometry_msgs::Pose latest_pose_;
